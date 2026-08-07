@@ -220,3 +220,154 @@ def test_inject_message_prefers_cli_when_attached(monkeypatch):
     assert ctx.inject_message("hello") is True
     assert cli._pending_input.items == ["hello"]
     assert session.get("queued_prompt") is None
+
+
+# ── surviving a disconnect ─────────────────────────────────────────────────
+#
+# A remote desktop client's WebSocket dropping reaps the live session
+# (_ws_orphan_reap) while the conversation survives in the session store and
+# returns on reconnect under a NEW sid. A report finishing in that window used
+# to be dropped: its target sid no longer existed. It is now routed by the
+# durable session key, and parked until the conversation comes back.
+
+def _park_isolated(monkeypatch):
+    """Give a test its own park store."""
+    monkeypatch.setattr(server, "_parked_injections", {})
+    monkeypatch.setattr(server, "_parked_injections_lock", threading.Lock())
+
+
+def test_durable_key_delivers_when_the_sid_is_already_gone(monkeypatch):
+    _park_isolated(monkeypatch)
+    # Reconnected before the report landed: new sid, same durable key.
+    reborn = _session(running=True, session_key="conv-1", last_active=100.0)
+    monkeypatch.setattr(server, "_sessions", {"sid-new": reborn})
+
+    assert server.inject_external_message(
+        "run finished", target_sid="sid-old-and-reaped", target_key="conv-1"
+    ) is True
+    assert reborn["queued_prompt"]["text"] == "run finished"
+    assert server._parked_injections == {}
+
+
+def test_report_parks_when_nothing_is_live(monkeypatch):
+    _park_isolated(monkeypatch)
+    monkeypatch.setattr(server, "_sessions", {})
+
+    assert server.inject_external_message(
+        "run finished", target_sid="sid-old", target_key="conv-1"
+    ) is True
+    assert [text for _ts, text in server._parked_injections["conv-1"]] == [
+        "run finished"
+    ]
+
+
+def test_parked_report_is_delivered_when_the_session_returns(monkeypatch):
+    """The case this exists for: the report lands BEFORE the client reconnects."""
+    _park_isolated(monkeypatch)
+    monkeypatch.setattr(server, "_sessions", {})
+    monkeypatch.setattr(server, "_register_session_cwd", lambda s: None)
+    fired = {}
+
+    def fake_run_prompt_submit(rid, sid, session, text, **kwargs):
+        fired["sid"] = sid
+        fired["text"] = text
+
+    monkeypatch.setattr(server, "_run_prompt_submit", fake_run_prompt_submit)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda s: False)
+
+    assert server.inject_external_message(
+        "run finished", target_sid="sid-old", target_key="conv-1"
+    ) is True
+
+    # ... now the desktop reconnects and resumes the same conversation.
+    reborn = _session(session_key="conv-1", last_active=200.0)
+    assert server._claim_or_reuse_live("sid-new", "conv-1", reborn, None) is None
+
+    assert _wait_until(lambda: fired.get("text") == "run finished")
+    assert fired["sid"] == "sid-new"
+    assert server._parked_injections == {}
+
+
+def test_parked_reports_drain_in_arrival_order(monkeypatch):
+    _park_isolated(monkeypatch)
+    monkeypatch.setattr(server, "_sessions", {})
+    monkeypatch.setattr(server, "_register_session_cwd", lambda s: None)
+
+    for text in ("first report", "second report"):
+        server.inject_external_message(text, target_key="conv-1")
+
+    # Busy on return, so both merge into the queued prompt deterministically.
+    reborn = _session(running=True, session_key="conv-1")
+    server._claim_or_reuse_live("sid-new", "conv-1", reborn, None)
+
+    assert reborn["queued_prompt"]["text"] == "first report\n\nsecond report"
+
+
+def test_parking_never_reroutes_to_a_sibling_session(monkeypatch):
+    """The no-rerouting rule still holds: an unreachable target parks, it does
+    not fall back to whichever other conversation happens to be open."""
+    _park_isolated(monkeypatch)
+    sibling = _session(running=True, session_key="conv-other", last_active=999.0)
+    monkeypatch.setattr(server, "_sessions", {"sid-sibling": sibling})
+
+    assert server.inject_external_message(
+        "session A's report", target_sid="sid-a", target_key="conv-a"
+    ) is True
+    assert sibling.get("queued_prompt") is None
+    assert "conv-a" in server._parked_injections
+
+
+def test_parked_reports_expire(monkeypatch):
+    _park_isolated(monkeypatch)
+    monkeypatch.setattr(server, "_sessions", {})
+    monkeypatch.setattr(server, "_register_session_cwd", lambda s: None)
+
+    server.inject_external_message("stale report", target_key="conv-1")
+    # Backdate past the TTL, as if the conversation never came back.
+    server._parked_injections["conv-1"] = [
+        (time.time() - server._PARKED_INJECTION_TTL_S - 1.0, "stale report")
+    ]
+
+    reborn = _session(running=True, session_key="conv-1")
+    server._claim_or_reuse_live("sid-new", "conv-1", reborn, None)
+
+    assert reborn.get("queued_prompt") is None
+    assert server._parked_injections == {}
+
+
+def test_park_depth_is_bounded_per_key(monkeypatch):
+    _park_isolated(monkeypatch)
+    monkeypatch.setattr(server, "_sessions", {})
+
+    for i in range(server._PARKED_INJECTIONS_PER_KEY + 5):
+        server.inject_external_message(f"report {i}", target_key="conv-1")
+
+    parked = [text for _ts, text in server._parked_injections["conv-1"]]
+    assert len(parked) == server._PARKED_INJECTIONS_PER_KEY
+    # Oldest evicted, newest kept.
+    assert parked[-1] == f"report {server._PARKED_INJECTIONS_PER_KEY + 4}"
+    assert "report 0" not in parked
+
+
+def test_untargeted_messages_are_never_parked(monkeypatch):
+    """No durable key means no destination to hold it for — keep the old
+    contract so the caller runs its degraded path instead of silently
+    accumulating messages nobody will ever claim."""
+    _park_isolated(monkeypatch)
+    monkeypatch.setattr(server, "_sessions", {})
+
+    assert server.inject_external_message("to whoever is listening") is False
+    assert server._parked_injections == {}
+
+
+def test_inject_message_forwards_the_durable_key(monkeypatch):
+    _park_isolated(monkeypatch)
+    reborn = _session(running=True, session_key="conv-1", last_active=100.0)
+    monkeypatch.setattr(server, "_sessions", {"sid-new": reborn})
+
+    ctx = _plugin_ctx()
+    assert ctx._manager._cli_ref is None
+    assert ctx.inject_message(
+        "run finished", session_id="sid-reaped", session_key="conv-1"
+    ) is True
+    assert reborn["queued_prompt"]["text"] == "run finished"

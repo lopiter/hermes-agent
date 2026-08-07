@@ -178,6 +178,23 @@ try:
 except (ValueError, TypeError):
     _ws_orphan_reap_grace = 20.0
 _WS_ORPHAN_REAP_GRACE_S = max(0.0, _ws_orphan_reap_grace)
+
+# External messages (see inject_external_message) whose target session was not
+# live at delivery time, keyed by durable session key → [(parked_at, text)].
+#
+# The reap above is exactly why this exists: a remote desktop's WebSocket
+# dropping takes the live session out of ``_sessions`` while the conversation
+# itself survives in the session store and returns on reconnect.  A completion
+# report arriving in that window has a real destination, just not a live one
+# yet, so it is parked here and handed over when the session comes back rather
+# than dropped.  Bounded in three directions — per-key depth, key count, and
+# age — because a session that never returns must not pin its reports forever.
+# In-memory only: a gateway restart discards parked messages.
+_parked_injections: dict[str, list[tuple[float, str]]] = {}
+_parked_injections_lock = threading.Lock()
+_PARKED_INJECTION_TTL_S = 24 * 3600.0
+_PARKED_INJECTIONS_PER_KEY = 20
+_PARKED_INJECTION_KEYS_MAX = 200
 _DETAIL_SECTION_NAMES = ("thinking", "tools", "subagents", "activity")
 _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
 
@@ -7560,7 +7577,118 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     return True
 
 
-def inject_external_message(text: Any, target_sid: str | None = None) -> bool:
+def _deliver_injection(sid: str, session: dict, text: str) -> bool:
+    """Hand one external message to a live session.
+
+    Mirrors ``prompt.submit``'s busy policy, minus the interrupt: a busy
+    session gets the message merged into its queued next-turn prompt
+    (``_enqueue_prompt`` is lossless, and a notification must never cancel
+    in-flight work), and an idle session starts a new turn immediately so the
+    model can relay the report right away.
+
+    Returns False when this session cannot take the message — a ``lazy`` watch
+    session (its runs live in the parent turn) or a record torn down out from
+    under us — so the caller can try the next candidate or park it.
+    """
+    if session.get("lazy"):
+        return False
+    lock = session.get("history_lock")
+    if lock is None:
+        return False
+    with lock:
+        # ``_enqueue_prompt``'s latest-transport-wins rule is meant for
+        # user resubmits; an external message carries no transport and
+        # must not clobber the pin of a user prompt already in the slot.
+        queued = session.get("queued_prompt") or {}
+        keep_transport = queued.get("transport")
+        running = bool(session.get("running"))
+        _enqueue_prompt(session, text, keep_transport)
+        if running:
+            session["last_active"] = time.time()
+            return True
+    # Idle: fire the queued message as a turn now. A user prompt racing
+    # this thread simply claims the session first — the queued message
+    # then drains at that turn's tail instead, so nothing is lost.
+    rid = f"inject-{uuid.uuid4().hex[:8]}"
+    threading.Thread(
+        target=_drain_queued_prompt, args=(rid, sid, session),
+        daemon=True, name=f"external-inject-{sid[:8]}",
+    ).start()
+    return True
+
+
+def _prune_parked_injections(now: float) -> None:
+    """Drop parked messages past their TTL. Caller holds the park lock."""
+    for key in list(_parked_injections):
+        fresh = [
+            entry for entry in _parked_injections[key]
+            if now - entry[0] < _PARKED_INJECTION_TTL_S
+        ]
+        if fresh:
+            _parked_injections[key] = fresh
+        else:
+            _parked_injections.pop(key, None)
+
+
+def _park_injection(session_key: str, text: str) -> bool:
+    """Hold a message for a session that is not live right now.
+
+    Returns True — the message is retained, and ``_drain_parked_injections``
+    delivers it when a session claims ``session_key`` again.
+    """
+    now = time.time()
+    with _parked_injections_lock:
+        _prune_parked_injections(now)
+        queue = _parked_injections.setdefault(session_key, [])
+        queue.append((now, text))
+        # Evict oldest-first within a key: the newest reports are the ones
+        # that still describe current state.
+        if len(queue) > _PARKED_INJECTIONS_PER_KEY:
+            del queue[: len(queue) - _PARKED_INJECTIONS_PER_KEY]
+        # And oldest-key-first across keys, so one abandoned session's backlog
+        # can't push out reports another session is still coming back for.
+        while len(_parked_injections) > _PARKED_INJECTION_KEYS_MAX:
+            oldest = min(
+                _parked_injections,
+                key=lambda k: _parked_injections[k][0][0],
+            )
+            if oldest == session_key:
+                break
+            _parked_injections.pop(oldest, None)
+    return True
+
+
+def _drain_parked_injections(sid: str, session: dict, session_key: str) -> int:
+    """Deliver messages parked for ``session_key`` into a session that just
+    became live. Returns the number handed over.
+
+    Must be called OUTSIDE ``_session_resume_lock``: delivery takes the
+    session's ``history_lock`` and can start a turn thread.
+    """
+    if not session_key:
+        return 0
+    with _parked_injections_lock:
+        _prune_parked_injections(time.time())
+        queued = _parked_injections.pop(session_key, [])
+    if not queued:
+        return 0
+    delivered = 0
+    for index, (_parked_at, text) in enumerate(queued):
+        if _deliver_injection(sid, session, text):
+            delivered += 1
+            continue
+        # The session went away again mid-drain. Put back what is left, in
+        # order, so a reconnect after this one still gets it.
+        with _parked_injections_lock:
+            rest = queued[index:] + _parked_injections.get(session_key, [])
+            _parked_injections[session_key] = rest[-_PARKED_INJECTIONS_PER_KEY:]
+        break
+    return delivered
+
+
+def inject_external_message(
+    text: Any, target_sid: str | None = None, target_key: str | None = None
+) -> bool:
     """Deliver an externally-originated message into a chat session, as if
     the user had typed it.
 
@@ -7570,29 +7698,37 @@ def inject_external_message(text: Any, target_sid: str | None = None) -> bool:
     conversation of a headless serving process, where no interactive CLI
     exists to receive them.
 
-    ``target_sid`` names the session that originated the work. When given,
-    the message is delivered to that session ONLY — if it has been closed
-    (or is unroutable), the message is dropped and False is returned, never
-    rerouted: a report about session A's work must not surface in session
-    B's conversation. Without a target the message goes to the most
-    recently active session (callers that genuinely address "whoever is
-    listening").
+    Targeting names the session that originated the work, and never widens:
 
-    Routing mirrors ``prompt.submit``'s busy policy, minus the interrupt: a
-    busy session gets the message merged into its queued next-turn prompt
-    (``_enqueue_prompt`` is lossless, and a notification must never cancel
-    in-flight work), and an idle session starts a new turn immediately so the
-    model can relay the report right away. ``lazy`` watch sessions are skipped
-    — their runs live in the parent turn.
+    * ``target_sid`` — the in-process UI session id. Delivered to that session
+      only, never rerouted to a sibling: a report about session A's work must
+      not surface in session B's conversation.
+    * ``target_key`` — the durable session key for the same conversation. Used
+      when the sid misses, which is the normal outcome once a remote client's
+      WebSocket has dropped and ``_ws_orphan_reap`` has taken the live session
+      away: the conversation returns on reconnect under a *new* sid, and the
+      durable key is what still identifies it. If it is not live either, the
+      message is parked under that key and delivered when the session comes
+      back (see ``_park_injection``).
 
-    Returns True when a session accepted the message; False when no live
-    session exists. Callers own the degraded path (log, webhook, drop).
+    Passing neither addresses "whoever is listening" and goes to the most
+    recently active session — for callers that genuinely mean that.
+
+    Returns True when the message was accepted (delivered or parked); False
+    when there was nowhere to put it. Callers own the degraded path.
     """
     if not isinstance(text, str) or not text.strip():
         return False
-    if target_sid is not None:
-        session = _sessions.get(target_sid)
-        candidates = [(target_sid, session)] if session is not None else []
+    targeted = target_sid is not None or target_key is not None
+    if targeted:
+        candidates: list[tuple[str, dict]] = []
+        session = _sessions.get(target_sid) if target_sid else None
+        if session is not None:
+            candidates.append((target_sid, session))
+        elif target_key:
+            live = _find_live_session_by_key(target_key)
+            if live is not None:
+                candidates.append(live)
     else:
         candidates = sorted(
             list(_sessions.items()),
@@ -7600,31 +7736,10 @@ def inject_external_message(text: Any, target_sid: str | None = None) -> bool:
             reverse=True,
         )
     for sid, session in candidates:
-        if session.get("lazy"):
-            continue
-        lock = session.get("history_lock")
-        if lock is None:
-            continue
-        with lock:
-            # ``_enqueue_prompt``'s latest-transport-wins rule is meant for
-            # user resubmits; an external message carries no transport and
-            # must not clobber the pin of a user prompt already in the slot.
-            queued = session.get("queued_prompt") or {}
-            keep_transport = queued.get("transport")
-            if session.get("running"):
-                _enqueue_prompt(session, text, keep_transport)
-                session["last_active"] = time.time()
-                return True
-            _enqueue_prompt(session, text, keep_transport)
-        # Idle: fire the queued message as a turn now. A user prompt racing
-        # this thread simply claims the session first — the queued message
-        # then drains at that turn's tail instead, so nothing is lost.
-        rid = f"inject-{uuid.uuid4().hex[:8]}"
-        threading.Thread(
-            target=_drain_queued_prompt, args=(rid, sid, session),
-            daemon=True, name=f"external-inject-{sid[:8]}",
-        ).start()
-        return True
+        if _deliver_injection(sid, session, text):
+            return True
+    if target_key:
+        return _park_injection(target_key, text)
     return False
 
 
@@ -7802,11 +7917,19 @@ def _claim_or_reuse_live(
         if live is not None:
             if lease is not None:
                 lease.release()
-            return live
-        with _sessions_lock:
-            _sessions[sid] = record
-            _register_session_cwd(_sessions[sid])
-    return None
+            claimed = live
+        else:
+            with _sessions_lock:
+                _sessions[sid] = record
+                _register_session_cwd(_sessions[sid])
+            claimed = None
+    # This is the one chokepoint where a conversation becomes live again after
+    # a reap, so it is where messages parked for it get handed over. Kept
+    # outside the resume lock: delivery takes the session's history_lock and
+    # can start a turn thread, neither of which belongs under a global lock.
+    drain_sid, drain_session = claimed if claimed is not None else (sid, record)
+    _drain_parked_injections(drain_sid, drain_session, session_key)
+    return claimed
 
 
 def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:

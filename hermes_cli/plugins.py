@@ -496,7 +496,11 @@ class PluginContext:
     # -- message injection --------------------------------------------------
 
     def inject_message(
-        self, content: str, role: str = "user", session_id: str | None = None
+        self,
+        content: str,
+        role: str = "user",
+        session_id: str | None = None,
+        session_key: str | None = None,
     ) -> bool:
         """Inject a message into the active conversation.
 
@@ -506,13 +510,22 @@ class PluginContext:
         This enables plugins (e.g. remote control viewers, messaging bridges)
         to send messages into the conversation from external sources.
 
-        ``session_id`` is the dashboard session that originated the work
-        (capture it inside the tool call via
-        ``gateway.session_context.get_session_env("HERMES_UI_SESSION_ID")``
-        — watcher threads spawned later don't inherit the ContextVar). When
-        set, headless routing delivers to that session only and drops the
-        message if it has been closed; the interactive CLI ignores it, having
-        a single conversation.
+        Both identifiers name the conversation that originated the work, and
+        should be captured inside the tool call via
+        ``gateway.session_context.get_session_env(...)`` — watcher threads
+        spawned later don't inherit the ContextVars:
+
+        * ``session_id`` — ``HERMES_UI_SESSION_ID``, the live dashboard
+          session. Headless routing delivers to that session only, never to a
+          sibling.
+        * ``session_key`` — ``HERMES_SESSION_KEY``, the durable key for the
+          same conversation. It is what still identifies the conversation
+          after a disconnect has torn down the live session, so passing it
+          lets a report survive the gap: delivered on reconnect rather than
+          dropped. Strongly recommended for background work that can outlive
+          a client's connection.
+
+        The interactive CLI ignores both, having a single conversation.
 
         Returns True if the message was queued successfully.
         """
@@ -531,7 +544,7 @@ class PluginContext:
             if tui_server is not None:
                 try:
                     if tui_server.inject_external_message(
-                        msg, target_sid=session_id
+                        msg, target_sid=session_id, target_key=session_key
                     ):
                         return True
                 except Exception:
